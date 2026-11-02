@@ -3,21 +3,135 @@ Simple integration tests for gNOI File service.
 
 All tests automatically run with TLS server configuration by default.
 Users don't need to worry about TLS configuration.
+
+Public-read boundary tests and the missing-path assertion require an image
+containing sonic-gnmi #851. A package containing only #807 is insufficient.
 """
 
+import base64
+import hashlib
 import logging
+import shlex
 
 import pytest
 
 from tests.common.fixtures.grpc_fixtures import gnmi_tls  # noqa: F401
 from tests.common.helpers.assertions import pytest_assert
+from tests.common.ptf_grpc import PtfGrpcError
 from tests.common.utilities import wait_until
+from tests.gnmi.helper import set_gnoi_client_role
 
 logger = logging.getLogger(__name__)
 
 pytestmark = [
     pytest.mark.topology("any"),
 ]
+
+
+@pytest.fixture
+def public_read_tree(gnmi_tls):  # noqa: F811
+    """Synthetic host files only; never read real private DUT data."""
+    dut = gnmi_tls.duthost
+    root = dut.tempfile(state="directory", prefix="gnoi-public-read-")["path"]
+    try:
+        dut.file(path=root, state="directory", mode="0755")
+        dut.file(path=root + "/private-dir", state="directory", mode="0700")
+        for name, mode in [("public", "0644"), ("private", "0600"), ("private-dir/public", "0644")]:
+            dut.copy(content="gNOI public read fixture\n", dest=root + "/" + name, mode=mode)
+        for name, target in [
+            ("public-link", root + "/public"),
+            ("relative-public-link", "public"),
+            ("private-link", root + "/private"),
+            ("private-parent-link", root + "/private-dir/public"),
+            ("dangling-link", root + "/missing"),
+        ]:
+            dut.file(path=root + "/" + name, src=target, state="link", force=True, follow=False)
+        set_gnoi_client_role(gnmi_tls, "gnoi_readonly")
+        gnmi_tls.grpc.configure_max_time(30)
+        yield root
+    finally:
+        dut.file(path=root, state="absent")
+        assert not dut.stat(path=root)["stat"]["exists"]
+
+
+@pytest.mark.disable_loganalyzer
+@pytest.mark.parametrize("method", ["Get", "Stat"])
+@pytest.mark.parametrize(
+    "name,allowed",
+    [
+        ("public", True),
+        ("public-link", True),
+        ("relative-public-link", True),
+        ("private", False),
+        ("private-dir/public", False),
+        ("private-dir/../public", False),
+        ("private-link", False),
+        ("private-parent-link", False),
+        ("missing", False),
+        ("dangling-link", False),
+    ],
+)
+def test_gnoi_file_public_read(gnmi_tls, public_read_tree, method, name, allowed):  # noqa: F811
+    """Requires #851: an authorized reader must still pass public-file checks."""
+    path = public_read_tree + "/" + name
+    if method == "Get":
+        call = gnmi_tls.grpc.call_server_streaming
+        request = {"remote_file": path}
+    else:
+        call = gnmi_tls.grpc.call_unary
+        request = {"path": path}
+    if allowed:
+        response = call("gnoi.file.File", method, request)
+        content = b"gNOI public read fixture\n"
+        if method == "Get":
+            assert response and "hash" in response[-1]
+            assert b"".join(base64.b64decode(item["contents"]) for item in response[:-1]) == content
+            assert response[-1]["hash"]["method"] == "MD5"
+            assert base64.b64decode(response[-1]["hash"]["hash"]) == hashlib.md5(content).digest()
+        else:
+            assert len(response["stats"]) == 1
+            assert response["stats"][0]["path"] == path
+            assert int(response["stats"][0]["size"]) == len(content)
+    else:
+        # A final RPC error does not establish that zero bytes were streamed.
+        with pytest.raises(PtfGrpcError, match=r"\bCode: PermissionDenied\b"):
+            call("gnoi.file.File", method, request)
+    logger.info(
+        "Public read check: DUT=%s method=%s case=%s expected=actual=%s",
+        gnmi_tls.duthost.hostname,
+        method,
+        name,
+        "OK" if allowed else "PermissionDenied",
+    )
+
+
+def test_gnoi_file_stat_filters_private_entries(gnmi_tls, public_read_tree):  # noqa: F811
+    """#851: directory listings expose only publicly readable children."""
+    response = gnmi_tls.grpc.call_unary("gnoi.file.File", "Stat", {"path": public_read_tree})
+    paths = [entry["path"] for entry in response.get("stats", [])]
+    expected = {public_read_tree + "/" + name for name in ("public", "public-link", "relative-public-link")}
+    assert len(paths) == len(expected)
+    assert set(paths) == expected
+    logger.info("Public listing check: DUT=%s expected=actual=%s", gnmi_tls.duthost.hostname, sorted(paths))
+
+
+@pytest.mark.disable_loganalyzer
+@pytest.mark.parametrize("method", ["Get", "Stat"])
+def test_gnoi_file_read_rejects_extended_acl(gnmi_tls, public_read_tree, method):  # noqa: F811
+    """#851 rejects extended access ACLs even when the other-read bit is set.
+
+    Requires setfacl and POSIX ACL support on the test filesystem.
+    """
+    dut = gnmi_tls.duthost
+    path = public_read_tree + "/public"
+    dut.command("setfacl -m u:65534:--- {}".format(shlex.quote(path)))
+    assert int(dut.stat(path=path)["stat"]["mode"], 8) & 0o004
+    with pytest.raises(PtfGrpcError, match=r"\bCode: PermissionDenied\b"):
+        if method == "Get":
+            gnmi_tls.grpc.call_server_streaming("gnoi.file.File", method, {"remote_file": path})
+        else:
+            gnmi_tls.grpc.call_unary("gnoi.file.File", method, {"path": path})
+    logger.info("Extended ACL check: DUT=%s method=%s expected=actual=PermissionDenied", dut.hostname, method)
 
 
 def test_file_stat(gnmi_tls):  # noqa: F811
@@ -170,17 +284,11 @@ def test_gnoi_file_stat_directory(gnmi_tls):  # noqa: F811
 
 
 def test_gnoi_file_stat_not_found(gnmi_tls):  # noqa: F811
-    """Verify File.Stat returns NOT_FOUND error for a non-existent path"""
-    try:
-        gnmi_tls.gnoi.file_stat("/etc/this_path_does_not_exist_gnoi_test")
-        pytest_assert(False, "File.Stat should have failed for non-existent path but returned success")
-    except Exception as e:
-        err = str(e)
-        logger.info("File.Stat NOT_FOUND response: {}".format(err))
-        pytest_assert(
-            "NotFound" in err or "not found" in err.lower() or "no such file" in err.lower(),
-            "Expected NOT_FOUND error, got: {}".format(err),
-        )
+    """#851 hides non-existent paths with the same error as private files."""
+    set_gnoi_client_role(gnmi_tls, "gnoi_readonly")
+    gnmi_tls.grpc.configure_max_time(30)
+    with pytest.raises(PtfGrpcError, match=r"\bCode: PermissionDenied\b"):
+        gnmi_tls.grpc.call_unary("gnoi.file.File", "Stat", {"path": "/etc/this_path_does_not_exist_gnoi_test"})
 
 
 @pytest.mark.parametrize(
