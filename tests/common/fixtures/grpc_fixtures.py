@@ -300,11 +300,14 @@ def gnmi_tls(request, duthosts, ptfhost):
 
         # PygnmiClient runs in the sonic-mgmt orchestrator and reads the locally
         # generated certs in cert_dir (not the PTF-side copies).
+        # PTF already verified TLS and an RPC above. Avoid initializing gRPC
+        # threads in the pytest parent until a test actually needs this client.
         pygnmi_client = PygnmiClient(
             host, port, plaintext=False,
             ca_cert=f"{cert_dir}/{grpc_config.CA_CERT}",
             client_cert=f"{cert_dir}/{grpc_config.CLIENT_CERT}",
             client_key=f"{cert_dir}/{grpc_config.CLIENT_KEY}",
+            connect=False,
         )
 
         fixture = GnmiFixture(
@@ -582,8 +585,9 @@ def _restart_gnoi_server(duthost):
     # Restart gnmi-native process to pick up new configuration
     result = duthost.shell("docker exec gnmi supervisorctl restart gnmi-native", module_ignore_errors=True)
 
-    if result['rc'] != 0:
-        raise Exception(f"Failed to restart gnmi-native: {result['stderr']}")
+    if result.get('rc', 1) != 0:
+        detail = result.get('stderr') or result.get('module_stderr') or result.get('msg', 'no error detail')
+        raise RuntimeError(f"Failed to restart gnmi-native: rc={result.get('rc')}, {detail}")
 
     # Wait for supervisor to report RUNNING as a guard against immediate
     # crash loops.

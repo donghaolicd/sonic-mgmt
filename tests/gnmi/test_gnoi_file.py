@@ -12,6 +12,7 @@ import base64
 import hashlib
 import logging
 import shlex
+from contextlib import ExitStack
 
 import pytest
 
@@ -71,17 +72,17 @@ def public_read_tree(gnmi_tls):  # noqa: F811
         ("dangling-link", False),
     ],
 )
-def test_gnoi_file_public_read(gnmi_tls, public_read_tree, method, name, allowed):  # noqa: F811
+def test_gnoi_file_public_read(gnmi_tls, public_read_tree, method, name, allowed, request):  # noqa: F811
     """Requires #851: an authorized reader must still pass public-file checks."""
     path = public_read_tree + "/" + name
     if method == "Get":
         call = gnmi_tls.grpc.call_server_streaming
-        request = {"remote_file": path}
+        rpc_request = {"remote_file": path}
     else:
         call = gnmi_tls.grpc.call_unary
-        request = {"path": path}
+        rpc_request = {"path": path}
     if allowed:
-        response = call("gnoi.file.File", method, request)
+        response = call("gnoi.file.File", method, rpc_request)
         content = b"gNOI public read fixture\n"
         if method == "Get":
             assert response and "hash" in response[-1]
@@ -95,29 +96,29 @@ def test_gnoi_file_public_read(gnmi_tls, public_read_tree, method, name, allowed
     else:
         # A final RPC error does not establish that zero bytes were streamed.
         with pytest.raises(PtfGrpcError, match=r"\bCode: PermissionDenied\b"):
-            call("gnoi.file.File", method, request)
+            call("gnoi.file.File", method, rpc_request)
     logger.info(
-        "Public read check: DUT=%s method=%s case=%s expected=actual=%s",
-        gnmi_tls.duthost.hostname,
+        "AUTHZ_VERIFIED node=%s method=%s case=%s expected=actual=%s scope=test-body",
+        request.node.nodeid,
         method,
         name,
         "OK" if allowed else "PermissionDenied",
     )
 
 
-def test_gnoi_file_stat_filters_private_entries(gnmi_tls, public_read_tree):  # noqa: F811
+def test_gnoi_file_stat_filters_private_entries(gnmi_tls, public_read_tree, request):  # noqa: F811
     """#851: directory listings expose only publicly readable children."""
     response = gnmi_tls.grpc.call_unary("gnoi.file.File", "Stat", {"path": public_read_tree})
     paths = [entry["path"] for entry in response.get("stats", [])]
     expected = {public_read_tree + "/" + name for name in ("public", "public-link", "relative-public-link")}
     assert len(paths) == len(expected)
     assert set(paths) == expected
-    logger.info("Public listing check: DUT=%s expected=actual=%s", gnmi_tls.duthost.hostname, sorted(paths))
+    logger.info("AUTHZ_VERIFIED node=%s method=Stat public_entries=%s scope=test-body", request.node.nodeid, len(paths))
 
 
 @pytest.mark.disable_loganalyzer
 @pytest.mark.parametrize("method", ["Get", "Stat"])
-def test_gnoi_file_read_rejects_extended_acl(gnmi_tls, public_read_tree, method):  # noqa: F811
+def test_gnoi_file_read_rejects_extended_acl(gnmi_tls, public_read_tree, method, request):  # noqa: F811
     """#851 rejects extended access ACLs even when the other-read bit is set.
 
     Requires setfacl and POSIX ACL support on the test filesystem.
@@ -131,7 +132,11 @@ def test_gnoi_file_read_rejects_extended_acl(gnmi_tls, public_read_tree, method)
             gnmi_tls.grpc.call_server_streaming("gnoi.file.File", method, {"remote_file": path})
         else:
             gnmi_tls.grpc.call_unary("gnoi.file.File", method, {"path": path})
-    logger.info("Extended ACL check: DUT=%s method=%s expected=actual=PermissionDenied", dut.hostname, method)
+    logger.info(
+        "AUTHZ_VERIFIED node=%s method=%s expected=actual=PermissionDenied scope=test-body",
+        request.node.nodeid,
+        method,
+    )
 
 
 def test_file_stat(gnmi_tls):  # noqa: F811
@@ -145,40 +150,91 @@ def test_file_stat(gnmi_tls):  # noqa: F811
         logger.warning(f"File.Stat failed (expected): {e}")
 
 
-def test_file_transfer_to_remote(gnmi_tls, ptfhost, duthosts, rand_one_dut_hostname):  # noqa: F811
+def test_file_transfer_to_remote(gnmi_tls, ptfhost):  # noqa: F811
     """Test File.TransferToRemote RPC downloading file from HTTP server to DUT."""
-    duthost = duthosts[rand_one_dut_hostname]
+    duthost = gnmi_tls.duthost
     # Test file configuration
     test_filename = "test.txt"
     test_content = "Hello from gNOI TransferToRemote test!"
-    local_path = f"/tmp/{test_filename}"
-    http_port = 8080
-    try:
+    with ExitStack() as cleanup:
+        local_dir = duthost.tempfile(state="directory", prefix="gnoi-transfer-")["path"]
+        cleanup.callback(duthost.file, path=local_dir, state="absent")
+        local_path = local_dir + "/" + test_filename
+        server_dir = ptfhost.tempfile(state="directory", prefix="gnoi-transfer-")["path"]
+        cleanup.callback(ptfhost.file, path=server_dir, state="absent")
         # 1. Create test file on PTF host
         logger.info(f"Creating test file {test_filename} on PTF host")
-        ptfhost.shell(f"echo '{test_content}' > /tmp/{test_filename}")
+        ptfhost.copy(content=test_content, dest=server_dir + "/" + test_filename)
         # 2. Start HTTP server on PTF host
-        logger.info(f"Starting HTTP server on PTF host port {http_port}")
-        ptfhost.command(f"cd /tmp && python -m http.server {http_port}", module_async=True)
-        # 3. Wait for HTTP server to start
+        # Bind an unused port and stop only this test's server. command() does
+        # not interpret shell 'cd', and a broad pkill could affect other tests.
         ptf_ip = ptfhost.mgmt_ip
-        logger.info("Waiting for HTTP server to start at {}:{}".format(ptf_ip, http_port))
+        ipv6 = ":" in ptf_ip
+        server = (
+            "import http.server,os,socket; "
+            f"os.chdir({server_dir!r}); "
+            "S=type('Server',(http.server.HTTPServer,),{'address_family':socket.%s}); "
+            "s=S(('%s',0),http.server.SimpleHTTPRequestHandler); "
+            "open('port','w').write(str(s.server_port)); s.serve_forever()"
+        ) % ("AF_INET6" if ipv6 else "AF_INET", "::" if ipv6 else "0.0.0.0")
+        pid = ptfhost.shell(
+            "python3 -c {} >{}/server.log 2>&1 </dev/null & echo $!".format(shlex.quote(server), server_dir)
+        )["stdout"].strip()
+        pytest_assert(pid.isdigit(), "HTTP server did not return a PID")
+
+        def stop_server():
+            # Verify ownership before signalling; wait for exit (or an exited
+            # zombie awaiting its parent) before removing the served directory.
+            stop = """import os,signal,time
+from pathlib import Path
+pid = int(%r)
+proc = Path('/proc') / str(pid)
+def alive():
+    try:
+        return proc.joinpath('stat').read_text().rsplit(')', 1)[1].split()[0] != 'Z'
+    except FileNotFoundError:
+        return False
+if alive():
+    assert %r.encode() in proc.joinpath('cmdline').read_bytes(), 'HTTP PID ownership mismatch'
+    os.kill(pid, signal.SIGTERM)
+for _ in range(50):
+    if not alive():
+        break
+    time.sleep(0.1)
+assert not alive(), 'HTTP server did not exit after SIGTERM'
+""" % (
+                pid,
+                server_dir,
+            )
+            ptfhost.command(argv=["python3", "-c", stop])
+
+        cleanup.callback(stop_server)
+        http_port = None
+        # 3. Wait for HTTP server to start
+        http_host = "[{}]".format(ptf_ip) if ":" in ptf_ip else ptf_ip
 
         def server_ready():
+            nonlocal http_port
             try:
+                port = ptfhost.command("cat " + server_dir + "/port")["stdout"].strip()
+                if not port.isdigit():
+                    return False
+                http_port = int(port)
                 result = ptfhost.command(
-                    "curl -f --max-time 2 {}:{}".format(ptf_ip, http_port), module_ignore_errors=True
+                    "curl -f --max-time 2 http://{}:{}/{}".format(http_host, http_port, test_filename),
+                    module_ignore_errors=True,
                 )
                 return result["rc"] == 0
             except Exception:
                 return False
 
-        wait_until(30, 2, 2, server_ready)
+        pytest_assert(wait_until(30, 2, 2, server_ready), "HTTP server did not become ready")
         logger.info("HTTP server is ready")
         # 4. Test TransferToRemote
-        remote_url = "http://{}:{}/{}".format(ptf_ip, http_port, test_filename)
+        remote_url = "http://{}:{}/{}".format(http_host, http_port, test_filename)
         logger.info(f"Testing TransferToRemote: {remote_url} -> {local_path}")
-        result = gnmi_tls.gnoi.file_transfer_to_remote(local_path=local_path, remote_url=remote_url, protocol="HTTP")
+        gnmi_tls.grpc.configure_max_time(60)
+        result = gnmi_tls.gnoi.file_transfer_to_remote(local_path=local_path, url=remote_url, protocol="HTTP")
         # 5. Verify response has hash
         pytest_assert("hash" in result, "TransferToRemote response missing hash field")
         logger.info(f"TransferToRemote response: {result}")
@@ -189,27 +245,13 @@ def test_file_transfer_to_remote(gnmi_tls, ptfhost, duthosts, rand_one_dut_hostn
         # 7. Verify downloaded content
         downloaded_content = duthost.shell(f"cat {local_path}")["stdout"].strip()
         pytest_assert(
-            test_content in downloaded_content,
+            test_content == downloaded_content,
             f"Content mismatch. Expected: '{test_content}', Got: '{downloaded_content}'",
         )
         logger.info(f"File content verified: {downloaded_content}")
-        logger.info("TransferToRemote test completed successfully")
-    except Exception as e:
-        # File service may not be fully implemented
-        logger.warning(f"File.TransferToRemote failed (may be expected): {e}")
-    finally:
-        # 8. Cleanup
-        logger.info("Cleaning up test resources")
-        try:
-            # Stop HTTP server
-            ptfhost.command(f"pkill -f 'python.*http.server.*{http_port}'", module_ignore_errors=True)
-            # Remove test file from PTF
-            ptfhost.shell(f"rm -f /tmp/{test_filename}", module_ignore_errors=True)
-            # Remove downloaded file from DUT
-            duthost.shell(f"rm -f {local_path}", module_ignore_errors=True)
-            logger.info("Cleanup completed")
-        except Exception as cleanup_e:
-            logger.warning(f"Cleanup failed: {cleanup_e}")
+    pytest_assert(not duthost.stat(path=local_dir)["stat"]["exists"], "DUT transfer directory was not removed")
+    pytest_assert(not ptfhost.stat(path=server_dir)["stat"]["exists"], "PTF HTTP directory was not removed")
+    logger.info("TransferToRemote content verified and test files cleaned up")
 
 
 def test_gnoi_file_stat_regular_file(gnmi_tls):  # noqa: F811
@@ -283,12 +325,15 @@ def test_gnoi_file_stat_directory(gnmi_tls):  # noqa: F811
         )
 
 
-def test_gnoi_file_stat_not_found(gnmi_tls):  # noqa: F811
+def test_gnoi_file_stat_not_found(gnmi_tls, request):  # noqa: F811
     """#851 hides non-existent paths with the same error as private files."""
     set_gnoi_client_role(gnmi_tls, "gnoi_readonly")
     gnmi_tls.grpc.configure_max_time(30)
     with pytest.raises(PtfGrpcError, match=r"\bCode: PermissionDenied\b"):
         gnmi_tls.grpc.call_unary("gnoi.file.File", "Stat", {"path": "/etc/this_path_does_not_exist_gnoi_test"})
+    logger.info(
+        "AUTHZ_VERIFIED node=%s method=Stat expected=actual=PermissionDenied scope=test-body", request.node.nodeid
+    )
 
 
 @pytest.mark.parametrize(
